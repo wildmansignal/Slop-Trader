@@ -993,6 +993,29 @@
         </div>
       </div>
 
+      <div class="panel" id="radar-panel">
+        <h3><span class="dot" id="radar-dot"></span>Pump Radar <span style="font-weight:400;color:var(--muted);font-size:10px">· who is about to move, and where to get in</span></h3>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+          <button class="btn-primary" id="radar-toggle" style="padding:5px 10px;font-size:11px">▶ Start radar</button>
+          <button id="radar-scan" style="padding:5px 10px;font-size:11px">⟳ Scan now</button>
+          <button id="radar-notify" style="padding:5px 10px;font-size:11px" title="Desktop alert when a coin ignites">🔔 Alerts</button>
+        </div>
+        <div id="radar-status" style="font-size:10px;color:var(--muted);margin-bottom:6px">idle</div>
+        <div id="radar-list" style="font-size:11px"><div class="vault-empty">Scan to see what is heating up.</div></div>
+        <details style="margin-top:8px"><summary style="cursor:pointer;font-size:10px;color:var(--muted);text-transform:uppercase">Radar settings &amp; how to read it</summary>
+          <div class="form-row"><label>Scan every (minutes)</label><input type="number" id="radar-interval" min="1" max="60" step="1"></div>
+          <div class="form-row"><label>Universe: top N USDT pairs by 24h volume</label><input type="number" id="radar-universe" min="20" max="200" step="10"></div>
+          <div class="form-row"><label>Alert when score is at least</label><input type="number" id="radar-min" min="30" max="100" step="5"></div>
+          <div class="form-row"><label>Paper buy size per click ($)</label><input type="number" id="radar-size" min="25" max="5000" step="25"></div>
+          <div style="font-size:10px;color:var(--muted);margin-top:4px">
+            <b style="color:var(--yellow)">PRE-PUMP</b>: price coiled in a tight range, volume building, buyers leaning on the book. Not moved yet. Set the entry above the range.<br>
+            <b style="color:var(--green)">IGNITING</b>: volume 3x+ normal, breaking the last 4 hours' high, still under 10% up on the day. This is the "get in" moment: buy the break of the trigger, stop under the last three 15-minute lows.<br>
+            <b style="color:var(--red)">EXTENDED</b>: already up big or RSI cooked. You are late; wait for a pullback or skip.<br>
+            Signals come from 15-minute candles and the live order book on Gate.io. Paper only: every buy button here goes into the Portfolio Manager's paper account.
+          </div>
+        </details>
+      </div>
+
       <div class="panel" id="pm-panel">
         <h3><span class="dot" id="pm-dot"></span>Portfolio Manager <span style="font-weight:400;color:var(--muted);font-size:10px">· paper · spot only · no leverage</span></h3>
         <div class="stats" style="margin-bottom:6px">
@@ -4448,6 +4471,93 @@ function pmBind() {
 }
 function pmTick() { if (!PM.on || PM.running) return; if (Date.now() - PM.lastRun >= PM.cfg.intervalMin * 60_000) pmRun(); else { for (const [sym, h] of Object.entries(PM.holdings)) { const px = pmPrice(sym); if (px && px <= h.high * (1 - PM.cfg.stopPct / 100)) { pmSell(sym, `trailing stop ${PM.cfg.stopPct}% from high`); pmSave(); } } pmRender(); } }
 document.addEventListener('DOMContentLoaded', () => { pmLoad(); pmBind(); pmRender(); setInterval(pmTick, 30_000); if (PM.on) setTimeout(() => pmRun(), 8000); });
+
+
+/* =====================================================================================
+   PUMP RADAR: early-move detection across the Gate.io USDT universe.
+   15m candles + live order book → score 0-100 → PRE-PUMP / IGNITING / EXTENDED with an
+   entry trigger, a stop and targets. Desktop alert when something ignites.
+   ===================================================================================== */
+const RADAR_KEY = 'sloptrader_radar_v1';
+const RADAR = { on: false, notify: true, running: false, results: [], scannedAt: 0, lastAlert: {}, cfg: { intervalMin: 3, universe: 80, minScore: 70, buyUsd: 500 } };
+function radarLoad() { try { const s = JSON.parse(localStorage.getItem(RADAR_KEY) || 'null'); if (s) { for (const k of ['on','notify','results','scannedAt','lastAlert']) if (s[k] !== undefined) RADAR[k] = s[k]; if (s.cfg) Object.assign(RADAR.cfg, s.cfg); } } catch (e) {} }
+function radarSave() { try { localStorage.setItem(RADAR_KEY, JSON.stringify({ on: RADAR.on, notify: RADAR.notify, results: RADAR.results.slice(0, 30), scannedAt: RADAR.scannedAt, lastAlert: RADAR.lastAlert, cfg: RADAR.cfg })); } catch (e) {} }
+async function radarBook(sym) {
+  try { const r = await fetch(viaProxy(`${GATE_REST}/spot/order_book?currency_pair=${toGateSymbol(sym)}&limit=20`)); if (!r.ok) return null; const b = await r.json();
+    const sum = (rows) => rows.reduce((a, [p, q]) => a + parseFloat(p) * parseFloat(q), 0); const bid = sum(b.bids || []), ask = sum(b.asks || []); return (bid + ask) ? bid / (bid + ask) : null; } catch (e) { return null; }
+}
+function radarScore(bars, book) {
+  if (!bars || bars.length < 40) return null;
+  const n = bars.length, last = bars[n - 1], c = bars.map(b => b.close), v = bars.map(b => b.volume), hi = bars.map(b => b.high), lo = bars.map(b => b.low);
+  const avg = (a) => a.reduce((x, y) => x + y, 0) / (a.length || 1);
+  const volNow = v[n - 1], volBase = avg(v.slice(-26, -2)) || 1, surge = volNow / volBase, surge3 = avg(v.slice(-3)) / volBase;
+  const roc15 = c[n - 1] / c[n - 2] - 1, roc1h = c[n - 1] / (c[n - 5] || c[n - 1]) - 1, roc4h = c[n - 1] / (c[n - 17] || c[n - 1]) - 1;
+  const rangeHi = Math.max(...hi.slice(-17, -1)), rangeLo = Math.min(...lo.slice(-17, -1)), width = (rangeHi - rangeLo) / c[n - 1];
+  const breakout = last.close > rangeHi, coiled = width < 0.045, volRising = v[n - 1] > v[n - 2] && v[n - 2] > v[n - 3];
+  const higherLows = Math.min(...lo.slice(-12, -6)) < Math.min(...lo.slice(-6)), r = rsi(c, 14), rsiNow = r[r.length - 1];
+  const clip = (x, a, b) => Math.max(a, Math.min(b, x));
+  let score = 0;
+  score += 30 * clip(surge - 1, 0, 4) / 4;              // volume expansion is the earliest tell
+  score += 10 * clip(surge3 - 1, 0, 3) / 3;
+  score += breakout ? 18 : last.close > rangeHi * 0.995 ? 9 : 0;
+  score += coiled ? 12 : width < 0.08 ? 5 : 0;
+  score += volRising ? 6 : 0;
+  score += higherLows ? 6 : 0;
+  score += book != null ? 12 * clip((book - 0.5) / 0.25, -1, 1) : 0;
+  score += roc15 > 0.004 && roc15 < 0.06 ? 8 : roc15 <= 0 ? -6 : 0;
+  score -= roc4h > 0.12 ? 25 : roc4h > 0.08 ? 10 : 0;
+  score -= rsiNow > 85 ? 20 : rsiNow > 78 ? 8 : 0;
+  score = Math.round(clip(score, 0, 100));
+  let state = 'WATCH';
+  if (roc4h > 0.12 || rsiNow > 85) state = 'EXTENDED';
+  else if (surge >= 2.5 && (breakout || roc15 > 0.008) && roc4h < 0.12) state = 'IGNITING';
+  else if (score >= 40 && !breakout && roc4h < 0.06) state = 'PRE-PUMP';
+  const trigger = state === 'IGNITING' && last.close > rangeHi ? last.close : rangeHi;
+  const stop = Math.min(...lo.slice(-3)), risk = Math.max(trigger - stop, trigger * 0.01);
+  return { score, state, last: last.close, roc15, roc1h, roc4h, surge, book, breakout, coiled, rsi: rsiNow, trigger, stop, t1: trigger + 2 * risk, t2: trigger + 3 * risk, riskPct: risk / trigger * 100 };
+}
+async function radarScan(manual = false) {
+  if (RADAR.running) return; RADAR.running = true; radarStatus('scanning…'); const $ = (id) => document.getElementById(id); if ($('radar-dot')) $('radar-dot').className = 'dot live';
+  try {
+    const uni = (await gateAllUsdtPairs()).filter(p => !PM_EXCLUDE.test(p.sym) && p.quoteVol >= 1_000_000).slice(0, RADAR.cfg.universe);
+    const out = []; let i = 0, done = 0;
+    await Promise.all(Array.from({ length: 6 }, async () => { while (i < uni.length) { const p = uni[i++]; const [bars, book] = await Promise.all([fetchBars(p.sym, '15m', 60), radarBook(p.sym)]); const s = radarScore(bars, book); if (s) out.push({ sym: p.sym, quoteVol: p.quoteVol, ...s }); done++; if (done % 10 === 0) radarStatus(`scanning ${done}/${uni.length}…`); } }));
+    out.sort((a, b) => b.score - a.score); RADAR.results = out.slice(0, 30); RADAR.scannedAt = Date.now();
+    for (const x of out) State.prices[x.sym] = x.last;
+    const hot = out.filter(x => x.state === 'IGNITING' && x.score >= RADAR.cfg.minScore);
+    for (const x of hot) { const lastAt = RADAR.lastAlert[x.sym] || 0; if (Date.now() - lastAt > 60 * 60_000) { RADAR.lastAlert[x.sym] = Date.now(); log('radar', 'buy', `🚀 ${x.sym} igniting · score ${x.score} · vol ${x.surge.toFixed(1)}x · entry ${fmtPrice(x.trigger)} stop ${fmtPrice(x.stop)}`); if (RADAR.notify) radarNotify(x); } }
+    const pre = out.filter(x => x.state === 'PRE-PUMP').length, ign = out.filter(x => x.state === 'IGNITING').length;
+    radarStatus(`${new Date().toLocaleTimeString()} · ${out.length} scanned · ${ign} igniting (${hot.length} above alert score) · ${pre} pre-pump`);
+    radarSave(); radarRender();
+  } catch (e) { radarStatus('scan failed: ' + e.message); }
+  RADAR.running = false; if ($('radar-dot')) $('radar-dot').className = 'dot' + (RADAR.on ? ' live' : '');
+}
+function radarNotify(x) { if (!('Notification' in window) || Notification.permission !== 'granted') return; try { new Notification(`🚀 ${x.sym.replace('USDT','')} is igniting (score ${x.score})`, { body: `Vol ${x.surge.toFixed(1)}x · entry above ${fmtPrice(x.trigger)} · stop ${fmtPrice(x.stop)} · target ${fmtPrice(x.t1)}`, tag: 'radar_' + x.sym }); } catch (e) {} }
+function radarStatus(t) { const el = document.getElementById('radar-status'); if (el) el.textContent = t; }
+function radarRender() {
+  const $ = (id) => document.getElementById(id); if (!$('radar-list')) return;
+  $('radar-toggle').textContent = RADAR.on ? '⏸ Stop radar' : '▶ Start radar'; $('radar-notify').style.opacity = RADAR.notify ? '1' : '.5';
+  const col = { 'IGNITING': 'var(--green)', 'PRE-PUMP': 'var(--yellow)', 'EXTENDED': 'var(--red)', 'WATCH': 'var(--muted)' };
+  const rows = RADAR.results.filter(x => x.state !== 'WATCH').slice(0, 12);
+  const quiet = !rows.length && RADAR.results.length ? `<div class="vault-empty">Nothing igniting right now. Closest to moving:</div>` + RADAR.results.slice(0, 3).map(x => `<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted);padding:2px 0"><span><b style="color:var(--text)">${x.sym.replace('USDT','')}</b> score ${x.score} · vol ${x.surge.toFixed(1)}x${x.coiled ? ' · coiled' : ''}</span><span>entry above ${fmtPrice(x.trigger)}</span></div>`).join('') : '';
+  $('radar-list').innerHTML = rows.length ? rows.map(x => `
+    <div style="border:1px solid var(--line);border-left:3px solid ${col[x.state]};border-radius:0 4px 4px 0;padding:6px 8px;margin-bottom:6px;background:var(--bg-2)">
+      <div style="display:flex;justify-content:space-between;align-items:center"><b style="color:var(--text)">${x.sym.replace('USDT','')}</b><span style="color:${col[x.state]};font-weight:700;font-size:10px">${x.state} · ${x.score}</span></div>
+      <div style="color:var(--muted);font-size:10px;margin-top:2px">15m ${(x.roc15*100).toFixed(1)}% · 1h ${(x.roc1h*100).toFixed(1)}% · 4h ${(x.roc4h*100).toFixed(1)}% · vol ${x.surge.toFixed(1)}x${x.book != null ? ` · bids ${(x.book*100).toFixed(0)}%` : ''}${x.coiled ? ' · coiled' : ''}${x.breakout ? ' · breakout' : ''}</div>
+      <div style="font-size:10px;margin-top:3px"><span style="color:var(--text)">${x.state === 'IGNITING' ? 'Get in now' : x.state === 'PRE-PUMP' ? 'Get in above' : 'Wait for pullback to'} <b>${fmtPrice(x.trigger)}</b></span> · stop ${fmtPrice(x.stop)} (${x.riskPct.toFixed(1)}%) · targets ${fmtPrice(x.t1)} / ${fmtPrice(x.t2)}</div>
+      <div style="display:flex;gap:6px;margin-top:5px"><button style="padding:3px 8px;font-size:10px" onclick="switchSymbol('${x.sym}')">chart</button><button style="padding:3px 8px;font-size:10px" onclick="radarBuy('${x.sym}')">paper buy $${RADAR.cfg.buyUsd}</button></div>
+    </div>`).join('') : (quiet || `<div class="vault-empty">Scan to see what is heating up.</div>`);
+  for (const [id, k] of [['radar-interval','intervalMin'],['radar-universe','universe'],['radar-min','minScore'],['radar-size','buyUsd']]) { const el = $(id); if (el && document.activeElement !== el) el.value = RADAR.cfg[k]; }
+}
+function radarBuy(sym) { const usd = Math.min(RADAR.cfg.buyUsd, PM.cash); if (usd < 25) { alert('Portfolio paper account has no cash left.'); return; } if (pmBuy(sym, usd, 'pump radar')) { pmSave(); pmRender(); radarRender(); } }
+function radarBind() {
+  const $ = (id) => document.getElementById(id); if (!$('radar-toggle')) return;
+  $('radar-toggle').onclick = () => { RADAR.on = !RADAR.on; radarSave(); radarRender(); if (RADAR.on) { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); radarScan(); } else $('radar-dot').className = 'dot'; };
+  $('radar-scan').onclick = () => radarScan(true);
+  $('radar-notify').onclick = () => { RADAR.notify = !RADAR.notify; if (RADAR.notify && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission(); radarSave(); radarRender(); };
+  for (const [id, k] of [['radar-interval','intervalMin'],['radar-universe','universe'],['radar-min','minScore'],['radar-size','buyUsd']]) $(id).oninput = (e) => { RADAR.cfg[k] = +e.target.value; radarSave(); };
+}
+document.addEventListener('DOMContentLoaded', () => { radarLoad(); radarBind(); radarRender(); setInterval(() => { if (RADAR.on && !RADAR.running && Date.now() - RADAR.scannedAt >= RADAR.cfg.intervalMin * 60_000) radarScan(); }, 20_000); });
 
 </script>
 
