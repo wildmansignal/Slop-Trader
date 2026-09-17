@@ -993,6 +993,39 @@
         </div>
       </div>
 
+      <div class="panel" id="pm-panel">
+        <h3><span class="dot" id="pm-dot"></span>Portfolio Manager <span style="font-weight:400;color:var(--muted);font-size:10px">· paper · spot only · no leverage</span></h3>
+        <div class="stats" style="margin-bottom:6px">
+          <div class="stat"><div class="stat-label">Equity</div><div class="stat-value accent" id="pm-equity">$10,000.00</div></div>
+          <div class="stat"><div class="stat-label">Total P/L</div><div class="stat-value" id="pm-pl">+$0.00</div></div>
+          <div class="stat"><div class="stat-label">Regime</div><div class="stat-value" id="pm-regime" style="font-size:12px">--</div></div>
+        </div>
+        <canvas id="pm-spark" width="300" height="46" style="width:100%;height:46px;display:block;background:var(--bg-2);border:1px solid var(--line);border-radius:4px;margin-bottom:6px"></canvas>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+          <button class="btn-primary" id="pm-toggle" style="padding:5px 10px;font-size:11px">▶ Start auto-manage</button>
+          <button id="pm-run" style="padding:5px 10px;font-size:11px">⟳ Rebalance now</button>
+          <button id="pm-reset" style="padding:5px 10px;font-size:11px">↺ Reset $10k</button>
+        </div>
+        <div id="pm-status" style="font-size:10px;color:var(--muted);margin-bottom:6px">idle</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin:6px 0 2px">Holdings</div>
+        <div id="pm-holdings" style="font-size:11px"><div class="vault-empty">All cash. Start auto-manage to let it buy.</div></div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin:8px 0 2px">Top candidates <span id="pm-scored-at" style="text-transform:none"></span></div>
+        <div id="pm-candidates" style="font-size:11px;color:var(--muted)">not scored yet</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin:8px 0 2px">Recent trades</div>
+        <div id="pm-trades" style="font-size:10px;color:var(--muted)">none</div>
+        <details style="margin-top:8px"><summary style="cursor:pointer;font-size:10px;color:var(--muted);text-transform:uppercase">Rules &amp; settings</summary>
+          <div class="form-row"><label>Coins to hold (K)</label><input type="number" id="pm-k" min="1" max="15" step="1"></div>
+          <div class="form-row"><label>Rebalance every (minutes)</label><input type="number" id="pm-interval" min="5" max="1440" step="5"></div>
+          <div class="form-row"><label>Universe: top N USDT pairs by 24h volume</label><input type="number" id="pm-universe" min="20" max="150" step="10"></div>
+          <div class="form-row"><label>Trailing stop from high (%)</label><input type="number" id="pm-stop" min="2" max="30" step="0.5"></div>
+          <div class="form-row"><label>Risk-off when BTC 24h change below (%)</label><input type="number" id="pm-btc" min="-20" max="0" step="0.5"></div>
+          <div class="form-row"><label>Risk-off when fewer than this % of coins are up on the day</label><input type="number" id="pm-breadth" min="0" max="100" step="5"></div>
+          <div class="form-row"><label>Cash buffer (%)</label><input type="number" id="pm-cash" min="0" max="50" step="1"></div>
+          <div class="form-row"><label>Uniswap API key (stored locally; paper only for now, live on-chain routing not wired)</label><input type="password" id="pm-uniswap" placeholder="Uniswap Developer Platform key"></div>
+          <div style="font-size:10px;color:var(--muted);margin-top:4px">How it picks: 1h momentum (4h and 24h), EMA 9/21/50 trend, volume surge, RSI not overheated, closeness to the 48h high. It sells anything that falls out of the top ranks, breaks its 1h trend, or drops the stop % from its high. If BTC or breadth says the market is diving, it sells everything to USDT and waits.</div>
+        </details>
+      </div>
+
       <div class="panel">
         <h3>Live Execution Bridge</h3>
         <div class="form-row">
@@ -4277,6 +4310,145 @@ function bindChatUI() {
 }
 
 window.addEventListener('DOMContentLoaded', bindChatUI);
+
+/* =====================================================================================
+   PORTFOLIO MANAGER (paper, spot only, no leverage)
+   Rotates a paper account into the strongest coins in the Gate.io USDT universe, sells
+   what turns down, and sits in USDT when the market dives. Own state, own key, so it
+   never touches the strategy cockpit's positions or vault.
+   ===================================================================================== */
+const PM_KEY = 'sloptrader_pm_v1';
+const PM = {
+  on: false, cash: 10000, start: 10000, holdings: {}, equityHist: [], trades: [], lastRun: 0, running: false,
+  regime: { state: 'unknown', note: 'not scored yet' }, scores: [], scoredAt: 0,
+  cfg: { k: 5, intervalMin: 15, universe: 60, stopPct: 8, riskOffBtc: -3, riskOffBreadth: 35, cashPct: 5, feePct: 0.2, slipPct: 0.1, minScore: 15, uniswapKey: '' },
+};
+const PM_EXCLUDE = /^(USDT|USDC|DAI|TUSD|FDUSD|USDE|USDD|BUSD|PYUSD|USD1|USDP|GUSD|EUR|EURT|GBP|TRY|PAXG|XAUT|WBTC|WETH|STETH|CBBTC|WBETH)USDT$|(3L|3S|5L|5S|BEAR|BULL|UP|DOWN)USDT$/;
+
+function pmLoad() { try { const s = JSON.parse(localStorage.getItem(PM_KEY) || 'null'); if (s) { for (const k of ['on','cash','start','holdings','equityHist','trades','lastRun','regime','scores','scoredAt']) if (s[k] !== undefined) PM[k] = s[k]; if (s.cfg) Object.assign(PM.cfg, s.cfg); } } catch (e) {} }
+function pmSave() { try { localStorage.setItem(PM_KEY, JSON.stringify({ on: PM.on, cash: PM.cash, start: PM.start, holdings: PM.holdings, equityHist: PM.equityHist.slice(-500), trades: PM.trades.slice(-200), lastRun: PM.lastRun, regime: PM.regime, scores: PM.scores.slice(0, 20), scoredAt: PM.scoredAt, cfg: PM.cfg })); } catch (e) {} }
+const pmPrice = (sym) => (State.prices[sym] || (PM.scores.find(s => s.sym === sym) || {}).last || 0);
+function pmEquity() { let v = PM.cash; for (const [s, h] of Object.entries(PM.holdings)) v += h.qty * (pmPrice(s) || h.avg); return v; }
+const pmLog = (msg, tag = 'info') => log('portfolio', tag, msg);
+
+/* --- scoring: one symbol from its 1h bars --- */
+function pmScoreBars(bars) {
+  if (!bars || bars.length < 60) return null;
+  const c = bars.map(b => b.close), v = bars.map(b => b.volume), n = c.length, last = c[n - 1];
+  const roc = (k) => c[n - 1 - k] ? last / c[n - 1 - k] - 1 : 0;
+  const roc4 = roc(4), roc24 = roc(24), roc72 = roc(Math.min(72, n - 2));
+  const e9 = ema(c, 9), e21 = ema(c, 21), e50 = ema(c, 50);
+  const trendUp = e9[n-1] > e21[n-1] && e21[n-1] > e50[n-1], softUp = e9[n-1] > e21[n-1];
+  const slope21 = e21[n-1] / (e21[n-7] || e21[n-1]) - 1;
+  const volNow = v.slice(-4).reduce((a, b) => a + b, 0) / 4, volBase = v.slice(-52, -4).reduce((a, b) => a + b, 0) / 48 || 1;
+  const surge = volNow / volBase;
+  const r = rsi(c, 14); const rsiNow = r[r.length - 1];
+  const hi48 = Math.max(...bars.slice(-48).map(b => b.high)); const nearHigh = last / hi48;
+  const clip = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+  let score = 0;
+  score += 30 * clip(roc24, -0.15, 0.25) / 0.25;
+  score += 20 * clip(roc4, -0.08, 0.12) / 0.12;
+  score += 10 * clip(roc72, -0.3, 0.5) / 0.5;
+  score += 15 * (trendUp ? 1 : softUp ? 0.35 : -1);
+  score += 10 * clip(slope21, -0.05, 0.08) / 0.08;
+  score += 10 * clip(surge - 1, 0, 2) / 2;
+  score += rsiNow > 80 ? -12 : rsiNow > 74 ? -5 : rsiNow >= 50 ? 6 : 0;
+  score += nearHigh > 0.985 ? 5 : nearHigh < 0.85 ? -5 : 0;
+  return { score: Math.round(score * 10) / 10, last, roc4, roc24, trendUp, softUp, surge, rsi: rsiNow, nearHigh };
+}
+
+/* --- universe + scores + regime --- */
+async function pmScoreUniverse() {
+  const all = await gateAllUsdtPairs();
+  const uni = all.filter(p => !PM_EXCLUDE.test(p.sym) && p.quoteVol >= 1_500_000).slice(0, PM.cfg.universe);
+  const held = Object.keys(PM.holdings).filter(s => !uni.some(u => u.sym === s)).map(s => ({ sym: s, quoteVol: 0, changePct: 0, last: pmPrice(s) }));
+  const list = uni.concat(held);
+  if (!list.some(x => x.sym === 'BTCUSDT')) list.push({ sym: 'BTCUSDT', quoteVol: 0, changePct: 0, last: 0 });
+  const out = []; let i = 0;
+  await Promise.all(Array.from({ length: 5 }, async () => { while (i < list.length) { const p = list[i++]; const bars = await fetchBars(p.sym, '1h', 120); const s = pmScoreBars(bars); if (s) out.push({ sym: p.sym, quoteVol: p.quoteVol, ...s }); } }));
+  const btc = out.find(x => x.sym === 'BTCUSDT');
+  const tradable = out.filter(x => x.sym !== 'BTCUSDT' && x.quoteVol > 0);
+  const breadth = tradable.length ? 100 * tradable.filter(x => x.roc24 > 0).length / tradable.length : 50;
+  let state = 'risk-on', note = `BTC 24h ${btc ? (btc.roc24 * 100).toFixed(1) : '?'}% · ${breadth.toFixed(0)}% of coins up`;
+  if (btc && btc.roc24 * 100 <= PM.cfg.riskOffBtc) { state = 'risk-off'; note = `BTC ${(btc.roc24 * 100).toFixed(1)}% in 24h (limit ${PM.cfg.riskOffBtc}%)`; }
+  else if (breadth < PM.cfg.riskOffBreadth) { state = 'risk-off'; note = `only ${breadth.toFixed(0)}% of coins up on the day (limit ${PM.cfg.riskOffBreadth}%)`; }
+  else if (btc && !btc.softUp && btc.roc24 < 0) { state = 'risk-off'; note = `BTC 1h trend down and negative on the day`; }
+  PM.scores = tradable.sort((a, b) => b.score - a.score); PM.scoredAt = Date.now(); PM.regime = { state, note, breadth, btc24: btc ? btc.roc24 * 100 : null };
+  for (const x of out) State.prices[x.sym] = x.last;
+}
+
+/* --- fills (paper) --- */
+function pmBuy(sym, usd, why) {
+  const px = pmPrice(sym); if (!px || usd < 10) return false;
+  const fill = px * (1 + PM.cfg.slipPct / 100), fee = usd * PM.cfg.feePct / 100, qty = (usd - fee) / fill;
+  PM.cash -= usd; const h = PM.holdings[sym];
+  if (h) { const cost = h.avg * h.qty + (usd - fee); h.qty += qty; h.avg = cost / h.qty; h.high = Math.max(h.high, px); }
+  else PM.holdings[sym] = { qty, avg: fill, high: px, openedAt: Date.now() };
+  PM.trades.push({ t: Date.now(), side: 'BUY', sym, qty, px: fill, usd, why }); pmLog(`BUY ${sym} $${usd.toFixed(0)} @ ${fmtPrice(fill)} · ${why}`, 'buy'); return true;
+}
+function pmSell(sym, why, frac = 1) {
+  const h = PM.holdings[sym]; const px = pmPrice(sym); if (!h || !px) return false;
+  const qty = h.qty * frac, fill = px * (1 - PM.cfg.slipPct / 100), gross = qty * fill, fee = gross * PM.cfg.feePct / 100, net = gross - fee;
+  const pl = net - qty * h.avg; PM.cash += net; h.qty -= qty; if (h.qty * px < 1) delete PM.holdings[sym];
+  PM.trades.push({ t: Date.now(), side: 'SELL', sym, qty, px: fill, usd: net, pl, why }); pmLog(`SELL ${sym} $${net.toFixed(0)} @ ${fmtPrice(fill)} · ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)} · ${why}`, pl >= 0 ? 'win' : 'loss'); return true;
+}
+
+/* --- one management pass --- */
+async function pmRun(manual = false) {
+  if (PM.running) return; PM.running = true; pmStatus('scoring the universe…');
+  try {
+    await pmScoreUniverse();
+    const cfg = PM.cfg, top = PM.scores.slice(0, cfg.k), topSyms = new Set(top.map(s => s.sym)), wide = new Set(PM.scores.slice(0, cfg.k * 2).map(s => s.sym));
+    for (const [sym, h] of Object.entries(PM.holdings)) { const px = pmPrice(sym); if (px > h.high) h.high = px; }
+    if (PM.regime.state === 'risk-off') {
+      const n = Object.keys(PM.holdings).length; for (const sym of Object.keys(PM.holdings)) pmSell(sym, 'risk-off: ' + PM.regime.note);
+      pmStatus(`RISK-OFF · in USDT · ${PM.regime.note}`); if (n) pmLog(`risk-off: sold ${n} holdings to USDT (${PM.regime.note})`, 'warn');
+    } else {
+      for (const [sym, h] of Object.entries(PM.holdings)) {
+        const s = PM.scores.find(x => x.sym === sym), px = pmPrice(sym);
+        if (px <= h.high * (1 - cfg.stopPct / 100)) { pmSell(sym, `trailing stop ${cfg.stopPct}% from high`); continue; }
+        if (s && !s.softUp && s.roc4 < 0) { pmSell(sym, 'trend turned down (1h)'); continue; }
+        if (s && !wide.has(sym)) { pmSell(sym, 'rotated out of the top ranks'); continue; }
+        if (!s) { pmSell(sym, 'no longer in the tradable universe'); }
+      }
+      const eq = pmEquity(), buffer = eq * cfg.cashPct / 100, targets = top.filter(s => s.score >= cfg.minScore && !PM.holdings[s.sym]);
+      let avail = PM.cash - buffer; const per = Math.min(eq / cfg.k, avail / Math.max(1, targets.length));
+      for (const s of targets) { if (avail < 25 || per < 25) break; const usd = Math.min(per, avail); if (pmBuy(s.sym, usd, `rank ${PM.scores.indexOf(s) + 1} · score ${s.score} · 24h ${(s.roc24 * 100).toFixed(1)}%`)) avail -= usd; }
+      pmStatus(`RISK-ON · ${Object.keys(PM.holdings).length} held · ${PM.regime.note}`);
+    }
+    PM.lastRun = Date.now(); PM.equityHist.push({ t: Date.now(), eq: pmEquity() }); pmSave(); pmRender();
+  } catch (e) { pmStatus('run failed: ' + e.message); pmLog('portfolio run failed: ' + e.message, 'info'); }
+  PM.running = false;
+}
+
+/* --- ui --- */
+function pmStatus(t) { const el = document.getElementById('pm-status'); if (el) el.textContent = t; }
+function pmRender() {
+  const eq = pmEquity(), pl = eq - PM.start; const $ = (id) => document.getElementById(id);
+  if (!$('pm-equity')) return;
+  $('pm-equity').textContent = '$' + eq.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  $('pm-pl').textContent = (pl >= 0 ? '+' : '-') + '$' + Math.abs(pl).toFixed(2) + ` (${(pl / PM.start * 100).toFixed(2)}%)`; $('pm-pl').className = 'stat-value ' + (pl >= 0 ? 'green' : 'red');
+  $('pm-regime').textContent = PM.regime.state.toUpperCase(); $('pm-regime').className = 'stat-value ' + (PM.regime.state === 'risk-on' ? 'green' : PM.regime.state === 'risk-off' ? 'red' : ''); $('pm-regime').title = PM.regime.note || '';
+  $('pm-toggle').textContent = PM.on ? '⏸ Stop auto-manage' : '▶ Start auto-manage'; $('pm-dot').className = 'dot' + (PM.on ? ' live' : '');
+  const hs = Object.entries(PM.holdings);
+  $('pm-holdings').innerHTML = hs.length ? hs.map(([s, h]) => { const px = pmPrice(s) || h.avg, p = (px / h.avg - 1) * 100; return `<div class="vault-row"><span class="coin">${s.replace('USDT','')}</span><span class="qty">${(h.qty * px).toFixed(0)} USD · in ${fmtPrice(h.avg)}</span><span class="usd" style="color:${p >= 0 ? 'var(--green)' : 'var(--red)'}">${p >= 0 ? '+' : ''}${p.toFixed(1)}%</span></div>`; }).join('') + `<div style="color:var(--muted);margin-top:2px">cash $${PM.cash.toFixed(0)}</div>` : `<div class="vault-empty">All cash ($${PM.cash.toFixed(0)}). ${PM.on ? 'Waiting for a risk-on market and ranked coins.' : 'Start auto-manage to let it buy.'}</div>`;
+  $('pm-candidates').innerHTML = PM.scores.length ? PM.scores.slice(0, 8).map((s, i) => `<div style="display:flex;justify-content:space-between"><span>${i + 1}. <b style="color:var(--text)">${s.sym.replace('USDT','')}</b>${PM.holdings[s.sym] ? ' <span style="color:var(--accent)">held</span>' : ''}</span><span>${s.score.toFixed(0)} · ${(s.roc24 * 100).toFixed(1)}%</span></div>`).join('') : 'not scored yet';
+  $('pm-scored-at').textContent = PM.scoredAt ? '· ' + new Date(PM.scoredAt).toLocaleTimeString() : '';
+  $('pm-trades').innerHTML = PM.trades.length ? PM.trades.slice(-8).reverse().map(t => `<div>${new Date(t.t).toLocaleTimeString()} <b style="color:${t.side === 'BUY' ? 'var(--green)' : 'var(--red)'}">${t.side}</b> ${t.sym.replace('USDT','')} $${t.usd.toFixed(0)}${t.pl !== undefined ? ` (${t.pl >= 0 ? '+' : ''}${t.pl.toFixed(2)})` : ''} <span style="color:var(--muted)">${t.why}</span></div>`).join('') : 'none';
+  const cv = $('pm-spark'); if (cv && PM.equityHist.length > 1) { const ctx = cv.getContext('2d'), W = cv.width, H = cv.height, h = PM.equityHist.slice(-300), lo = Math.min(...h.map(x => x.eq)), hi = Math.max(...h.map(x => x.eq)) || 1; ctx.clearRect(0, 0, W, H); ctx.strokeStyle = h[h.length - 1].eq >= PM.start ? '#3dff8f' : '#ff5a5a'; ctx.lineWidth = 1.5; ctx.beginPath(); h.forEach((x, i) => { const px = i / (h.length - 1) * (W - 4) + 2, py = H - 3 - (hi === lo ? 0.5 : (x.eq - lo) / (hi - lo)) * (H - 6); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }); ctx.stroke(); }
+  for (const [id, k] of [['pm-k','k'],['pm-interval','intervalMin'],['pm-universe','universe'],['pm-stop','stopPct'],['pm-btc','riskOffBtc'],['pm-breadth','riskOffBreadth'],['pm-cash','cashPct'],['pm-uniswap','uniswapKey']]) { const el = $(id); if (el && document.activeElement !== el) el.value = PM.cfg[k]; }
+}
+function pmBind() {
+  const $ = (id) => document.getElementById(id); if (!$('pm-toggle')) return;
+  $('pm-toggle').onclick = () => { PM.on = !PM.on; pmSave(); pmRender(); pmLog(PM.on ? 'auto-manage ON (paper)' : 'auto-manage OFF', 'info'); if (PM.on) pmRun(); };
+  $('pm-run').onclick = () => pmRun(true);
+  $('pm-reset').onclick = () => { if (!confirm('Reset the portfolio paper account to $10,000? Trades and history are cleared.')) return; Object.assign(PM, { cash: 10000, start: 10000, holdings: {}, equityHist: [], trades: [], lastRun: 0 }); pmSave(); pmRender(); pmStatus('reset to $10,000'); };
+  for (const [id, k, num] of [['pm-k','k',1],['pm-interval','intervalMin',1],['pm-universe','universe',1],['pm-stop','stopPct',1],['pm-btc','riskOffBtc',1],['pm-breadth','riskOffBreadth',1],['pm-cash','cashPct',1],['pm-uniswap','uniswapKey',0]])
+    $(id).oninput = (e) => { PM.cfg[k] = num ? +e.target.value : e.target.value; pmSave(); };
+}
+function pmTick() { if (!PM.on || PM.running) return; if (Date.now() - PM.lastRun >= PM.cfg.intervalMin * 60_000) pmRun(); else { for (const [sym, h] of Object.entries(PM.holdings)) { const px = pmPrice(sym); if (px && px <= h.high * (1 - PM.cfg.stopPct / 100)) { pmSell(sym, `trailing stop ${PM.cfg.stopPct}% from high`); pmSave(); } } pmRender(); } }
+document.addEventListener('DOMContentLoaded', () => { pmLoad(); pmBind(); pmRender(); setInterval(pmTick, 30_000); if (PM.on) setTimeout(() => pmRun(), 8000); });
+
 </script>
 
 <!-- AI CHAT BOT -->
